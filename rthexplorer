@@ -35,7 +35,7 @@ RESPONSE=$(curl -sk -D - --cookie-jar "$COOKIE_JAR" "https://$ROUTER_IP/html/hom
 SESSIONID=$(grep SessionID "$COOKIE_JAR" | awk '{print $7}')
 if [[ -z "$SESSIONID" ]]; then
   echo "❌ SessionID not found!"
-  rm "$COOKIE_JAR"
+  unset "$COOKIE_JAR"
   exit 1
 fi
 echo "[+] SessionID: $SESSIONID"
@@ -47,7 +47,7 @@ CSRF_TOKEN=$(echo "$CSRF_TOKEN" | tr -cd '[:alnum:]')
 
 if [[ -z "$CSRF_TOKEN" ]]; then
   echo "❌ CSRF Token not found..."
-  rm "$COOKIE_JAR"
+  unset "$COOKIE_JAR"
   exit 1
 fi
 echo "[+] CSRF Token: $CSRF_TOKEN"
@@ -81,7 +81,7 @@ if echo "$LOGIN_RESPONSE" | grep -q "<response>OK</response>"; then
 else
   echo "❌ Login failed!"
   echo "$LOGIN_RESPONSE"
-  rm "$COOKIE_JAR"
+  unset "$COOKIE_JAR"
   exit 1
 fi
 
@@ -93,7 +93,7 @@ NEW_CSRF_TOKEN=$(curl -sk -b "$COOKIE_JAR" "https://$ROUTER_IP/api/webserver/tok
 
 if [[ -z "$NEW_CSRF_TOKEN" ]]; then
   echo "❌ Failed to get new CSRF Token for SMS."
-  rm "$COOKIE_JAR"
+  unset "$COOKIE_JAR"
   exit 1
 fi
 echo "[+] New CSRF Token: $NEW_CSRF_TOKEN"
@@ -124,9 +124,9 @@ if echo "$SMS_RESPONSE" | grep -q "<response>OK</response>"; then
 else
   echo "❌ SMS sending failed!"
   echo "$SMS_RESPONSE"
-  rm "$COOKIE_JAR"
+  unset "$COOKIE_JAR"
   exit 1
 fi
 
 # Clean up
-rm "$COOKIE_JAR"
+unset "$COOKIE_JAR"

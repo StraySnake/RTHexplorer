@@ -1,11 +1,19 @@
-# RTHexplorer project
+*** RTHexplorer project ***
+
 
 Change into the script
 
 ROUTER_IP="192.168.8.1" # Your router IP
+
 USERNAME="admin" # Your username
+
 PASSWORD="admin123" # Your password
 
+
 How to use : 
+
 chmod +x rthexplorer
-./rthexplorer <destination phone number> <"message">
+
+./rthexplorer "destination phone number" "message"
+
+exemple # ./rthexplorer +33642928100 "Test"

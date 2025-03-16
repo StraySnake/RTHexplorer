@@ -1,5 +1,4 @@
 #!/bin/bash
-#./rthexplorer <destination phone number> <"message">
 
 # ====== CONFIGURATION ======
 ROUTER_IP="192.168.8.1"
@@ -22,31 +21,36 @@ sha256_hexstring_to_base64() {
     local sha256_hex=$(echo -n "$input_str" | openssl dgst -sha256 -hex | awk '{print $2}')
 
     # Base64 encode the HEX string directly (not as bytes)
-    # Adding -w 0 to prevent newlines on Linux
     echo -n "$sha256_hex" | base64 -w 0
 }
 
 # ====== HTTPS Connection ======
 echo "[*] Connecting to: https://$ROUTER_IP/html/home.html"
 
-RESPONSE=$(curl -sk -c cookies.txt "https://$ROUTER_IP/html/home.html")
+COOKIE_JAR=$(mktemp)
 
-# Get the SessionID from the cookie
-SESSIONID=$(grep SessionID cookies.txt | awk '{print $7}')
+RESPONSE=$(curl -sk -D - --cookie-jar "$COOKIE_JAR" "https://$ROUTER_IP/html/home.html")
+
+# Extract SessionID from cookie jar
+SESSIONID=$(grep SessionID "$COOKIE_JAR" | awk '{print $7}')
 if [[ -z "$SESSIONID" ]]; then
   echo "❌ SessionID not found!"
+  rm "$COOKIE_JAR"
   exit 1
 fi
+echo "[+] SessionID: $SESSIONID"
 
-# Get the CSRF Token from the HTML page
+# Extract CSRF Token from HTML response
 CSRF_TOKENS=$(echo "$RESPONSE" | grep -oP '<meta name="csrf_token" content="\K[^"]+')
 CSRF_TOKEN=$(echo "$CSRF_TOKENS" | tail -n 1)
 CSRF_TOKEN=$(echo "$CSRF_TOKEN" | tr -cd '[:alnum:]')
 
 if [[ -z "$CSRF_TOKEN" ]]; then
   echo "❌ CSRF Token not found..."
+  rm "$COOKIE_JAR"
   exit 1
 fi
+echo "[+] CSRF Token: $CSRF_TOKEN"
 
 # ====== Authentication ======
 echo "[*] Hashing the password..."
@@ -54,9 +58,10 @@ PASSWORD_HASHED=$(sha256_hexstring_to_base64 "$PASSWORD")
 CONCAT="${USERNAME}${PASSWORD_HASHED}${CSRF_TOKEN}"
 
 FINAL_PASSWORD=$(sha256_hexstring_to_base64 "$CONCAT")
+echo "[+] Password final to send: $FINAL_PASSWORD"
 
 # ====== Sending login request ======
-echo "[*] Trying to log in..."
+echo "[*] Attempting login..."
 
 LOGIN_XML="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <request>
@@ -65,31 +70,35 @@ LOGIN_XML="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
   <password_type>4</password_type>
 </request>"
 
-LOGIN_RESPONSE=$(curl -sk -b cookies.txt -c cookies.txt \
+LOGIN_RESPONSE=$(curl -sk -b "$COOKIE_JAR" --cookie-jar "$COOKIE_JAR" \
   -H "__RequestVerificationToken: $CSRF_TOKEN" \
   -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" \
   -X POST "https://$ROUTER_IP/api/user/login" \
   --data "$LOGIN_XML")
 
 if echo "$LOGIN_RESPONSE" | grep -q "<response>OK</response>"; then
-  echo "✅ Successfully logged in!"
+  echo "✅ Login successful!"
 else
   echo "❌ Login failed!"
   echo "$LOGIN_RESPONSE"
+  rm "$COOKIE_JAR"
   exit 1
 fi
 
 # ====== Sending the SMS ======
 echo "[*] Sending SMS to $PHONE_NUMBER: \"$MESSAGE\""
 
-# Retrieve a new CSRF token after login
-NEW_CSRF_TOKEN=$(curl -sk -b cookies.txt "https://$ROUTER_IP/api/webserver/token" | grep -oP "<token>\K[^<]+")
+# Get new CSRF Token after login
+NEW_CSRF_TOKEN=$(curl -sk -b "$COOKIE_JAR" "https://$ROUTER_IP/api/webserver/token" | grep -oP "<token>\K[^<]+")
+
 if [[ -z "$NEW_CSRF_TOKEN" ]]; then
-  echo "❌ Failed to get new CSRF Token for sending SMS."
+  echo "❌ Failed to get new CSRF Token for SMS."
+  rm "$COOKIE_JAR"
   exit 1
 fi
+echo "[+] New CSRF Token: $NEW_CSRF_TOKEN"
 
-# Create SMS XML payload
+# Prepare SMS XML
 SMS_XML="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <request>
   <Index>-1</Index>
@@ -103,8 +112,9 @@ SMS_XML="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
   <Date>$(date "+%Y-%m-%d %H:%M:%S")</Date>
 </request>"
 
-# Send the SMS
-SMS_RESPONSE=$(curl -sk -b cookies.txt -H "__RequestVerificationToken: $NEW_CSRF_TOKEN" \
+# Send SMS
+SMS_RESPONSE=$(curl -sk -b "$COOKIE_JAR" \
+  -H "__RequestVerificationToken: $NEW_CSRF_TOKEN" \
   -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" \
   -X POST "https://$ROUTER_IP/api/sms/send-sms" \
   --data "$SMS_XML")
@@ -112,7 +122,11 @@ SMS_RESPONSE=$(curl -sk -b cookies.txt -H "__RequestVerificationToken: $NEW_CSRF
 if echo "$SMS_RESPONSE" | grep -q "<response>OK</response>"; then
   echo "✅ SMS successfully sent!"
 else
-  echo "❌ Failed to send SMS!"
+  echo "❌ SMS sending failed!"
   echo "$SMS_RESPONSE"
+  rm "$COOKIE_JAR"
   exit 1
 fi
+
+# Clean up
+rm "$COOKIE_JAR"

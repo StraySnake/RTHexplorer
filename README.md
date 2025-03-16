@@ -4,6 +4,7 @@ Huawei B525s-23a sending SMS by bash script
 
 Certainly compatible with other Huawei 4G router
 
+Script type bash, need curl packet
 
  - Change into the script :
 

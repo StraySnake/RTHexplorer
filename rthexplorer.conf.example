@@ -9,3 +9,10 @@ HUAWEI_ROUTER_URL=https://192.168.8.1
 # Router administrator account (the one you use in the router web page)
 HUAWEI_USERNAME=admin
 HUAWEI_PASSWORD="change-me"
+
+# Optional: default recipients for "send default" (comma-separated)
+#HUAWEI_SMS_TO=+33611111111,+33622222222
+
+# Optional: rate limit, e.g. at most 20 SMS per hour (0 = no limit)
+#HUAWEI_SMS_LIMIT=20
+#HUAWEI_SMS_WINDOW=3600

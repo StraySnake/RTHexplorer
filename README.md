@@ -3,7 +3,8 @@
 Send SMS and check the status of a **Huawei 4G/LTE router** from the command line — using only the router's local web API.
 
 - **No cloud, no app, no extra software on the router**: it talks to the same local API as the router's web page.
-- **Two commands**: `send` an SMS, or check the router `status` (login, SIM card, mobile network, signal) **without sending anything**.
+- **Send** an SMS to one or several numbers with a single login, **read** received SMS (to control things by SMS), or check the router **status** (login, SIM card, mobile network, signal) **without sending anything**.
+- **Built-in rate limit**: never send hundreds of SMS by mistake.
 - **Script-friendly**: one machine-readable result line on stdout, progress on stderr, meaningful exit codes.
 - **Lightweight**: a single Bash script, in two flavours (with or without Python). Works on Raspberry Pi, NAS, Docker/Alpine containers, any Linux or macOS machine on the router's network.
 
@@ -74,7 +75,11 @@ Settings are read from a config file and/or environment variables. **Environment
 |---|---|---|
 | `HUAWEI_ROUTER_URL` | `https://192.168.8.1` | Router web address. Use `http://…` if your router has no HTTPS. |
 | `HUAWEI_USERNAME` | `admin` | Router administrator account |
-| `HUAWEI_PASSWORD` | *(required)* | Router administrator password |
+| `HUAWEI_PASSWORD` | *(required)* | Router administrator password (not needed on devices without login) |
+| `HUAWEI_SMS_TO` | *(empty)* | Default recipients for `send default`, comma-separated |
+| `HUAWEI_SMS_LIMIT` | `0` (no limit) | Maximum number of SMS per window |
+| `HUAWEI_SMS_WINDOW` | `3600` | Rate limit window, in seconds |
+| `HUAWEI_STATE_FILE` | `.rthexplorer_sent` next to the script | File used to count sent SMS |
 | `HUAWEI_CONFIG` | `rthexplorer.conf` next to the script | Path of the config file |
 
 ### Config file
@@ -96,20 +101,54 @@ HUAWEI_PASSWORD='my router password' ./rthexplorer.sh status
 ## Usage
 
 ```text
-rthexplorer.sh send <phone_number> <message>   Send an SMS
-rthexplorer.sh status                          Check the router (no SMS sent)
-rthexplorer.sh help                            Show help
+rthexplorer.sh send <number> [<number>...] <message>   Send an SMS (one login for all numbers)
+rthexplorer.sh inbox                                   Print unread received SMS, mark them read
+rthexplorer.sh status                                  Check the router (no SMS sent)
+rthexplorer.sh help                                    Show help
 ```
 
-A short form is also accepted for compatibility: `rthexplorer.sh <phone_number> <message>`.
-
-Use international phone numbers, e.g. `+33612345678`.
+- `<number>`: an international number such as `+33612345678`, a comma-separated list, or `default` (the numbers of `HUAWEI_SMS_TO`).
+- `<message>`: the text, or `-` to read it from **stdin**.
+- A short form is also accepted for compatibility: `rthexplorer.sh <number> <message>`.
 
 ### Send an SMS
 
 ```bash
 ./rthexplorer.sh send +33612345678 "Front door opened at $(date +%H:%M)"
 ```
+
+### Send to several people with one login
+
+```bash
+./rthexplorer.sh send +33611111111 +33622222222 "Backup finished"
+./rthexplorer.sh send +33611111111,+33622222222 "Same thing, comma-separated"
+./rthexplorer.sh send default "To the numbers of HUAWEI_SMS_TO"
+```
+
+Duplicates are removed. If one number is refused, the others are still sent and the result says which one failed.
+
+### Message from stdin
+
+Handy for tools that pipe their text (log watchers, notification systems):
+
+```bash
+echo "Disk almost full on $(hostname)" | ./rthexplorer.sh send default -
+```
+
+### Read received SMS
+
+```bash
+./rthexplorer.sh inbox
+```
+
+Prints each **unread** SMS as one JSON line, then marks it as read, so every message is returned only once:
+
+```text
+{"index":"40001","from":"+33611111111","date":"2026-11-04 21:00:00","text":"STATUS"}
+STATUS=OK;COUNT=1
+```
+
+Run it every minute (cron, home automation…) to **control things by SMS** — it works even when the internet connection is down, as long as the mobile network is up. Always check the `from` number before acting on a message.
 
 ### Check the router without sending anything
 
@@ -118,6 +157,10 @@ Use international phone numbers, e.g. `+33612345678`.
 ```
 
 It logs in, reads the SIM card state, the mobile network and the signal strength, then logs out. Ideal for a daily health check: you learn that SMS alerts are broken **before** you need them.
+
+### Rate limit
+
+Set `HUAWEI_SMS_LIMIT` (and optionally `HUAWEI_SMS_WINDOW`, in seconds) to cap the number of SMS, for example 20 per hour. Every SMS accepted by the router is counted in a small state file. When the limit is reached, the remaining numbers are skipped, the result line contains `LIMITED=1` and the exit code is `3`, so the caller can send a summary later instead of hundreds of messages.
 
 ## Output and exit codes
 
@@ -135,9 +178,12 @@ Exactly **one result line** is written to **stdout**, easy to parse:
 
 | Situation | stdout |
 |---|---|
-| SMS sent | `STATUS=OK;SMS=sent` |
+| SMS sent | `STATUS=OK;SMS=sent;SENT=2/2` |
 | Router healthy | `STATUS=OK;SIGNAL=4/5;OPERATOR=Orange F` |
-| Any problem | `STATUS=ERROR;DETAIL=<reason>` |
+| Inbox read | `STATUS=OK;COUNT=1` (after one JSON line per message) |
+| Some numbers refused | `STATUS=ERROR;DETAIL=SMS refused for +336… (code …);SENT=1/2` |
+| Rate limit reached | `STATUS=ERROR;DETAIL=rate limit reached (20 SMS per 3600 s);SENT=0/2;LIMITED=1` |
+| Any other problem | `STATUS=ERROR;DETAIL=<reason>` |
 
 Examples of `DETAIL`:
 
@@ -153,6 +199,7 @@ Examples of `DETAIL`:
 | `0` | Success |
 | `1` | Failure (see `DETAIL`) |
 | `2` | Wrong usage (missing arguments) |
+| `3` | Rate limit reached: some or all SMS were not sent |
 
 > "SMS accepted by the router" means the router queued the message. As with any SMS, delivery to the phone depends on the mobile network.
 
@@ -189,6 +236,7 @@ done
 shell_command:
   send_sms: >-
     bash /config/scripts/rthexplorer.sh send {{ number | to_json }} {{ message | to_json }}
+  read_sms: bash /config/scripts/rthexplorer.sh inbox
   sms_router_status: bash /config/scripts/rthexplorer.sh status
 ```
 
@@ -295,7 +343,7 @@ Please [open an issue](https://github.com/StraySnake/RTHexplorer/issues) with yo
    - Base64: `POST /api/user/login` with `base64(password)`
    - No password: nothing to do
 4. Get a fresh token: `GET /api/webserver/token`
-5. `send` → `POST /api/sms/send-sms` · `status` → `GET /api/monitoring/status` and `GET /api/net/current-plmn`
+5. `send` → `POST /api/sms/send-sms` (once per number, same session) · `inbox` → `POST /api/sms/sms-list` then `POST /api/sms/set-read` · `status` → `GET /api/monitoring/status` and `GET /api/net/current-plmn`
 6. Log out: `POST /api/user/logout`
 
 ## License

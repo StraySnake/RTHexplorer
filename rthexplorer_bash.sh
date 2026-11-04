@@ -9,29 +9,38 @@
 # No cloud service, no extra software on the router.
 #
 # Usage:
-#   rthexplorer_bash.sh send <phone_number> <message>   Send an SMS
-#   rthexplorer_bash.sh status                          Check the router (no SMS sent)
-#   rthexplorer_bash.sh help                            Show help
+#   rthexplorer_bash.sh send <number> [<number>...] <message>   Send an SMS to one or more numbers
+#                                                (one login for all of them)
+#   rthexplorer_bash.sh inbox                                   Print unread received SMS, mark them read
+#   rthexplorer_bash.sh status                                  Check the router (no SMS sent)
+#   rthexplorer_bash.sh help                                    Show help
 #
-#   Short form, kept for compatibility:
-#   rthexplorer_bash.sh <phone_number> <message>
+#   <number> may be a comma-separated list, or "default" (HUAWEI_SMS_TO).
+#   <message> "-" reads the message from stdin.
+#   Short form, kept for compatibility:  rthexplorer_bash.sh <number> <message>
 #
 # Output:
 #   Progress messages go to stderr.
-#   One machine-readable result line goes to stdout:
-#     STATUS=OK;SMS=sent
+#   One machine-readable result line goes to stdout (always the last line):
+#     STATUS=OK;SMS=sent;SENT=2/2
 #     STATUS=OK;SIGNAL=4/5;OPERATOR=Orange F
-#     STATUS=ERROR;DETAIL=<human readable reason>
+#     STATUS=OK;COUNT=1          (inbox: preceded by one JSON line per message)
+#     STATUS=ERROR;DETAIL=<human readable reason>[;SENT=1/2][;LIMITED=1]
 #
 # Exit codes:
 #   0  success
 #   1  failure (router unreachable, login refused, SIM problem, SMS refused…)
 #   2  wrong usage
+#   3  rate limit reached: some or all SMS were not sent (see HUAWEI_SMS_LIMIT)
 #
 # Configuration (environment variables override the config file):
 #   HUAWEI_ROUTER_URL   default: https://192.168.8.1
 #   HUAWEI_USERNAME     default: admin
-#   HUAWEI_PASSWORD     required
+#   HUAWEI_PASSWORD     required (unless the device has no login)
+#   HUAWEI_SMS_TO       default recipients for "send default", comma-separated
+#   HUAWEI_SMS_LIMIT    max SMS per window, 0 = no limit (default: 0)
+#   HUAWEI_SMS_WINDOW   rate limit window in seconds (default: 3600)
+#   HUAWEI_STATE_FILE   where sent SMS are counted, default: .rthexplorer_sent next to this script
 #   HUAWEI_CONFIG       config file, default: rthexplorer.conf next to this script
 #
 # Requirements: bash, curl, openssl (3.0+ for SCRAM routers), base64, sed, awk, mktemp, tr, od
@@ -76,12 +85,17 @@ fail() {
 usage() {
     cat >&2 <<EOF
 Usage:
-  $(basename "$0") send <phone_number> <message>   Send an SMS
-  $(basename "$0") status                          Check the router (no SMS sent)
-  $(basename "$0") help                            Show this help
+  $(basename "$0") send <number> [<number>...] <message>   Send an SMS (one login for all numbers)
+  $(basename "$0") inbox                                   Print unread SMS as JSON lines, mark them read
+  $(basename "$0") status                                  Check the router (no SMS sent)
+  $(basename "$0") help                                    Show this help
+
+  <number>  +33612345678, a comma-separated list, or "default" (HUAWEI_SMS_TO)
+  <message> text, or "-" to read it from stdin
 
 Configuration: $CONFIG_FILE
-  or environment variables HUAWEI_ROUTER_URL, HUAWEI_USERNAME, HUAWEI_PASSWORD
+  or environment variables HUAWEI_ROUTER_URL, HUAWEI_USERNAME, HUAWEI_PASSWORD,
+  HUAWEI_SMS_TO, HUAWEI_SMS_LIMIT, HUAWEI_SMS_WINDOW, HUAWEI_STATE_FILE
 EOF
 }
 
@@ -120,6 +134,15 @@ PASSWORD="${HUAWEI_PASSWORD:-$(read_config_value HUAWEI_PASSWORD)}"
 ROUTER_URL="${ROUTER_URL:-https://192.168.8.1}"
 ROUTER_URL="${ROUTER_URL%/}"
 USERNAME="${USERNAME:-admin}"
+
+SMS_TO="${HUAWEI_SMS_TO:-$(read_config_value HUAWEI_SMS_TO)}"
+SMS_LIMIT="${HUAWEI_SMS_LIMIT:-$(read_config_value HUAWEI_SMS_LIMIT)}"
+SMS_WINDOW="${HUAWEI_SMS_WINDOW:-$(read_config_value HUAWEI_SMS_WINDOW)}"
+STATE_FILE="${HUAWEI_STATE_FILE:-$(read_config_value HUAWEI_STATE_FILE)}"
+
+[[ "$SMS_LIMIT" =~ ^[0-9]+$ ]] || SMS_LIMIT=0
+[[ "$SMS_WINDOW" =~ ^[0-9]+$ && "$SMS_WINDOW" -gt 0 ]] || SMS_WINDOW=3600
+STATE_FILE="${STATE_FILE:-$SCRIPT_DIR/.rthexplorer_sent}"
 
 # -----------------------------------------------------------------------------
 # Small tools (pure shell: openssl + base64 + sed, no python3, no "grep -P")
@@ -205,6 +228,11 @@ scram_proof() {
     done
     server_key="$(hmac_sha256 "Server Key" "$salted")"
     echo "$proof $(hmac_sha256 "$auth" "$server_key")"
+}
+
+# Number of characters of a text (counted in UTF-8, so "é" is one character)
+char_count() {
+    ( LC_ALL=C.UTF-8; echo "${#1}" ) 2>/dev/null
 }
 
 # Print the router's error code from an API answer, if any
@@ -421,18 +449,50 @@ cmd_status() {
     exit 0
 }
 
-cmd_send() {
-    local phone="$1" message="$2"
+# --- Rate limit ---------------------------------------------------------------
+# Every SMS accepted by the router is recorded (one timestamp per line) in
+# $STATE_FILE. Only the last $SMS_WINDOW seconds are kept.
 
-    login
+# Print how many more SMS may be sent now ("unlimited" if no limit)
+rate_remaining() {
+    if [[ "$SMS_LIMIT" -eq 0 ]]; then
+        echo unlimited
+        return
+    fi
+    local now used
+    now="$(date +%s)"
+    used=0
+    if [[ -r "$STATE_FILE" ]]; then
+        used="$(awk -v min="$(( now - SMS_WINDOW ))" '$1 >= min' "$STATE_FILE" | wc -l | tr -d ' ')"
+    fi
+    echo $(( SMS_LIMIT > used ? SMS_LIMIT - used : 0 ))
+}
 
-    log "Sending SMS to $phone..."
-    local token
+# Record one sent SMS and forget the ones older than the window
+rate_record() {
+    [[ "$SMS_LIMIT" -eq 0 ]] && return 0
+    local now tmp
+    now="$(date +%s)"
+    tmp="$(mktemp)"
+    {
+        [[ -r "$STATE_FILE" ]] && awk -v min="$(( now - SMS_WINDOW ))" '$1 >= min' "$STATE_FILE"
+        echo "$now"
+    } > "$tmp"
+    cat "$tmp" > "$STATE_FILE" 2>/dev/null || log "cannot write $STATE_FILE (rate limit not recorded)"
+    rm -f -- "$tmp"
+}
+
+# --- Send ---------------------------------------------------------------------
+
+# Send one SMS in the current session. Prints the router error code on failure.
+send_one() {
+    local phone="$1" message="$2" token length date body answer
     token="$(fresh_token)" || token=""
-    [[ -n "$token" ]] || fail "cannot get a token to send the SMS"
-
-    local length date body answer
-    length="${#message}"     # number of characters (with a UTF-8 locale)
+    if [[ -z "$token" ]]; then
+        echo "no token"
+        return 1
+    fi
+    length="$(char_count "$message")"
     date="$(date "+%Y-%m-%d %H:%M:%S")"
     body="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <request>
@@ -446,16 +506,141 @@ cmd_send() {
     <Reserved>1</Reserved>
     <Date>$date</Date>
 </request>"
+    answer="$(api_post "/api/sms/send-sms" "$token" "$body")" || { echo "no answer"; return 1; }
+    printf '%s' "$answer" | grep -q "<response>OK</response>" && return 0
+    echo "code $(printf '%s' "$answer" | error_code)"
+    return 1
+}
 
-    answer="$(api_post "/api/sms/send-sms" "$token" "$body")" \
-        || fail "no answer from the router while sending"
+# Usage: cmd_send <number> [<number>...] <message>
+cmd_send() {
+    local message="${*: -1}"
+    local -a recipients=() parts=()
+    local arg number
 
-    if printf '%s' "$answer" | grep -q "<response>OK</response>"; then
-        ok "SMS accepted by the router"
-        echo "STATUS=OK;SMS=sent"
-        exit 0
+    # Recipients: each argument but the last; commas and "default" are expanded
+    for arg in "${@:1:$#-1}"; do
+        [[ "$arg" == "default" ]] && arg="$SMS_TO"
+        IFS=',' read -r -a parts <<< "$arg"
+        for number in "${parts[@]}"; do
+            number="${number//[[:space:]]/}"
+            [[ -n "$number" ]] || continue
+            [[ " ${recipients[*]} " == *" $number "* ]] || recipients+=("$number")
+        done
+    done
+    [[ ${#recipients[@]} -gt 0 ]] || fail "no recipient (give a number, or set HUAWEI_SMS_TO for \"default\")"
+
+    if [[ "$message" == "-" ]]; then
+        message="$(cat)"
     fi
-    fail "SMS refused by the router (code $(printf '%s' "$answer" | error_code))"
+    [[ -n "$message" ]] || fail "empty message"
+
+    local total=${#recipients[@]} remaining
+    remaining="$(rate_remaining)"
+    if [[ "$remaining" == "0" ]]; then
+        echo "[ERROR] rate limit reached ($SMS_LIMIT SMS per $SMS_WINDOW s): nothing sent" >&2
+        echo "STATUS=ERROR;DETAIL=rate limit reached ($SMS_LIMIT SMS per $SMS_WINDOW s);SENT=0/$total;LIMITED=1"
+        exit 3
+    fi
+
+    login
+
+    local sent=0 limited=0 errors="" result
+    for number in "${recipients[@]}"; do
+        if [[ "$remaining" != "unlimited" && "$sent" -ge "$remaining" ]]; then
+            limited=1
+            log "Rate limit reached: $number skipped"
+            continue
+        fi
+        log "Sending SMS to $number..."
+        if result="$(send_one "$number" "$message")"; then
+            sent=$(( sent + 1 ))
+            rate_record
+            ok "SMS to $number accepted by the router"
+        else
+            errors+="${errors:+, }$number ($result)"
+            echo "[ERROR] SMS to $number refused ($result)" >&2
+        fi
+    done
+
+    if [[ -n "$errors" ]]; then
+        echo "STATUS=ERROR;DETAIL=SMS refused for $errors;SENT=$sent/$total$([[ $limited == 1 ]] && echo ';LIMITED=1')"
+        exit 1
+    fi
+    if [[ "$limited" == "1" ]]; then
+        echo "STATUS=ERROR;DETAIL=rate limit reached ($SMS_LIMIT SMS per $SMS_WINDOW s);SENT=$sent/$total;LIMITED=1"
+        exit 3
+    fi
+    echo "STATUS=OK;SMS=sent;SENT=$sent/$total"
+    exit 0
+}
+
+# --- Inbox --------------------------------------------------------------------
+
+json_escape() {
+    local text="$1"
+    text="${text//\\/\\\\}"
+    text="${text//\"/\\\"}"
+    text="${text//$'\t'/ }"
+    printf '%s' "$text"
+}
+
+xml_unescape() {
+    local text="$1"
+    text="${text//&lt;/<}"
+    text="${text//&gt;/>}"
+    text="${text//&quot;/\"}"
+    text="${text//&apos;/\'}"
+    text="${text//&#39;/\'}"
+    text="${text//&amp;/&}"
+    printf '%s' "$text"
+}
+
+# Print unread received SMS (one JSON object per line), then mark them read.
+cmd_inbox() {
+    login
+
+    local token body answer
+    token="$(fresh_token)" || token=""
+    [[ -n "$token" ]] || fail "cannot get a token to read the SMS"
+    body='<?xml version="1.0" encoding="UTF-8"?>
+<request>
+    <PageIndex>1</PageIndex>
+    <ReadCount>50</ReadCount>
+    <BoxType>1</BoxType>
+    <SortType>0</SortType>
+    <Ascending>1</Ascending>
+    <UnreadPreferred>1</UnreadPreferred>
+</request>'
+    answer="$(api_post "/api/sms/sms-list" "$token" "$body")" || fail "no answer from the router while reading SMS"
+    printf '%s' "$answer" | grep -q "<error>" && fail "cannot read the SMS (code $(printf '%s' "$answer" | error_code))"
+
+    # One message per line (pure bash, no XML tool needed)
+    answer="${answer//$'\r'/ }"
+    answer="${answer//$'\n'/ }"
+    answer="${answer//<\/Message>/$'\n'}"
+
+    local count=0 line index phone date text
+    while IFS= read -r line; do
+        [[ "$line" =~ \<Smstat\>0\</Smstat\> ]] || continue          # 0 = unread
+        [[ "$line" =~ \<Index\>([^<]*)\</Index\> ]] && index="${BASH_REMATCH[1]}" || continue
+        [[ "$line" =~ \<Phone\>([^<]*)\</Phone\> ]] && phone="${BASH_REMATCH[1]}" || phone=""
+        [[ "$line" =~ \<Date\>([^<]*)\</Date\> ]] && date="${BASH_REMATCH[1]}" || date=""
+        [[ "$line" =~ \<Content\>([^<]*)\</Content\> ]] && text="${BASH_REMATCH[1]}" || text=""
+        text="$(xml_unescape "$text")"
+        printf '{"index":"%s","from":"%s","date":"%s","text":"%s"}\n' \
+            "$(json_escape "$index")" "$(json_escape "$(xml_unescape "$phone")")" \
+            "$(json_escape "$date")" "$(json_escape "$text")"
+        count=$(( count + 1 ))
+
+        token="$(fresh_token)" || token=""
+        [[ -n "$token" ]] && api_post "/api/sms/set-read" "$token" \
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><request><Index>$index</Index></request>" >/dev/null
+    done <<< "$answer"
+
+    ok "$count unread SMS"
+    echo "STATUS=OK;COUNT=$count"
+    exit 0
 }
 
 # -----------------------------------------------------------------------------
@@ -470,12 +655,16 @@ case "${1:-}" in
     status)
         cmd_status
         ;;
+    inbox)
+        cmd_inbox
+        ;;
     send)
-        if [[ -z "${2:-}" || -z "${3:-}" ]]; then
+        shift
+        if [[ $# -lt 2 ]]; then
             usage
             exit 2
         fi
-        cmd_send "$2" "$3"
+        cmd_send "$@"
         ;;
     help|-h|--help)
         usage
@@ -486,11 +675,11 @@ case "${1:-}" in
         exit 2
         ;;
     *)
-        # Short form: rthexplorer.sh <phone_number> <message>
-        if [[ -z "${2:-}" ]]; then
+        # Short form: rthexplorer.sh <number> <message>
+        if [[ $# -lt 2 ]]; then
             usage
             exit 2
         fi
-        cmd_send "$1" "$2"
+        cmd_send "$@"
         ;;
 esac

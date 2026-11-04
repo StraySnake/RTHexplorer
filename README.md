@@ -44,7 +44,7 @@ Everything below applies to both; just replace the script name.
 - A Huawei 4G/LTE router with a SIM card that can send SMS
 - A machine on the same network as the router, with `bash`, `curl`, `awk`, `mktemp`, and:
   - for `rthexplorer.sh`: `python3`
-  - for `rthexplorer_bash.sh`: `openssl`, `base64`, `sed`, `tr`
+  - for `rthexplorer_bash.sh`: `openssl` (3.0+ for SCRAM devices), `base64`, `sed`, `tr`, `od`
 
 Neither script needs the GNU-only `grep -P`, so both run on BusyBox-based systems.
 
@@ -194,11 +194,65 @@ shell_command:
 
 ## Compatibility
 
-The script uses the Huawei "HiLink" web API with the SHA-256 login scheme (`password_type 4`) found on many Huawei 4G/LTE routers and mobile Wi-Fi devices.
+RTHexplorer works with Huawei devices that use the **HiLink web API** — the local web interface found on Huawei 4G/LTE and 5G routers, mobile Wi-Fi hotspots and HiLink USB modems. To send SMS, the device must of course have a SIM card with an SMS-capable plan.
 
-It reads the anti-CSRF token either from the home page (`<meta name="csrf_token">`) or, on firmwares that don't publish it there, from `/api/webserver/SesTokInfo`.
+### Supported login methods
 
-It has been used on the author's Huawei 4G router. Other models using the same web API should work; firmwares with a different login scheme (older `password_type 3`, or newer encrypted logins) are not supported. **Reports of tested models are welcome** — please [open an issue](https://github.com/StraySnake/RTHexplorer/issues) or a pull request with your model and firmware version.
+The script asks the device which login it expects (`/api/user/state-login`) and picks the right one automatically:
+
+| Login method | Typically found on | Supported |
+|---|---|---|
+| No password (`State 0`) | HiLink USB modems, devices without login | ✅ |
+| Base64 password (`password_type 0` or `3`) | Older firmwares | ✅ |
+| SHA-256 password (`password_type 4`) | Most 4G/LTE routers and hotspots | ✅ |
+| SCRAM challenge (`challenge_login` / `authentication_login`) | Recent web interfaces, 5G CPE | ✅ (`rthexplorer_bash.sh` needs OpenSSL 3.0+) |
+| RSA-encrypted login | A few recent firmwares | ❌ |
+
+The anti-CSRF token is read from the home page (`<meta name="csrf_token">`) or, when a firmware doesn't publish it there, from `/api/webserver/SesTokInfo`.
+
+### Devices
+
+The models below are known to expose this same HiLink API (device list from the [huawei-lte-api](https://github.com/Salamek/huawei-lte-api) project). RTHexplorer itself has been used on the author's router; the other models have **not** been individually tested with this script — **reports are welcome**.
+
+**4G/LTE routers**
+
+| Series | Models |
+|---|---|
+| B31x | B310s-22, B311-221, B315s-22 |
+| B5xx | B525s-23a, B525s-65a, B528s, B535-232, SoyeaLink B535-333 |
+| B6xx | B612-233, B628-265 |
+| B7xx / B8xx | B715s-23c, B818-263 |
+| E51xx (home routers) | E5180s-22, E5186s-22a |
+
+**Mobile Wi-Fi hotspots (MiFi) and Wingles**
+
+| Models |
+|---|
+| E5573s-320, E5576-320, E5577Cs-321, E8231 |
+
+**USB modems** — only in **HiLink** (network) mode, not in serial "stick" mode
+
+| Models |
+|---|
+| E3131, E3372, E3531, E5530As-2, E8372h-608 |
+
+**5G routers** (SCRAM login)
+
+| Models |
+|---|
+| 5G CPE Pro (H112-372), 5G CPE Pro 2 (H122-373), 5G CPE 6 (H165-383) |
+
+Other Huawei devices with the same web interface will probably work too.
+
+### Not compatible
+
+- **B2368-22** and **B593s-22**: different firmware/API
+- USB modems running the **serial ("stick") firmware** instead of HiLink
+- Firmwares that only accept the **RSA-encrypted** login
+
+### Report your device
+
+Please [open an issue](https://github.com/StraySnake/RTHexplorer/issues) with your **model**, **firmware version**, the script you used and the result of `./rthexplorer.sh status` (it never shows your password). Confirmed models will be added to this list.
 
 ## Troubleshooting
 
@@ -208,7 +262,10 @@ It has been used on the author's Huawei 4G router. Other models using the same w
 | `login refused: wrong username or password` | Same credentials as the router web page? Special characters are fine inside quotes in the config file. |
 | `login refused: too many attempts` | The router locks logins after several failures. Wait a few minutes. |
 | `login refused: another session is already open` | Log out from the router web page in your browser. |
+| `login refused: the router asks to change the default password first` | Log in once in the router web page and set a new password. |
+| `login aborted: the router's identity could not be verified` | SCRAM signature mismatch: make sure you are really talking to your router (check `HUAWEI_ROUTER_URL`). |
 | `anti-CSRF token not found` | Your firmware may use a different API. Please [open an issue](https://github.com/StraySnake/RTHexplorer/issues) with your model. |
+| `could not compute the SCRAM login` | `rthexplorer_bash.sh` on a SCRAM device needs OpenSSL 3.0 or newer — or use `rthexplorer.sh`. |
 | `SIM card missing, locked or waiting for PIN` | Insert the SIM, or enter/disable the PIN in the router web page. |
 | `no mobile network` | Antenna, coverage, data/SMS plan, operator outage. |
 | `SMS refused by the router` | SMS allowed by your plan? Valid international number? SMS storage full (delete old messages in the router web page)? |
@@ -223,10 +280,15 @@ It has been used on the author's Huawei 4G router. Other models using the same w
 ## How it works
 
 1. Open a session: `GET /html/home.html` (session cookie + anti-CSRF token)
-2. Log in: `POST /api/user/login` with `base64(sha256hex(username + base64(sha256hex(password)) + token))`
-3. Get a fresh token: `GET /api/webserver/token`
-4. `send` → `POST /api/sms/send-sms` · `status` → `GET /api/monitoring/status` and `GET /api/net/current-plmn`
-5. Log out: `POST /api/user/logout`
+2. Detect the login method: `GET /api/user/state-login`
+3. Log in, depending on the device:
+   - SCRAM: `POST /api/user/challenge_login` then `POST /api/user/authentication_login` (the router's signature is checked)
+   - SHA-256: `POST /api/user/login` with `base64(sha256hex(username + base64(sha256hex(password)) + token))`
+   - Base64: `POST /api/user/login` with `base64(password)`
+   - No password: nothing to do
+4. Get a fresh token: `GET /api/webserver/token`
+5. `send` → `POST /api/sms/send-sms` · `status` → `GET /api/monitoring/status` and `GET /api/net/current-plmn`
+6. Log out: `POST /api/user/logout`
 
 ## License
 

@@ -149,6 +149,48 @@ sys.stdout.write(match.group(1).strip() if match else "")
 ' "$1"
 }
 
+# Anti-CSRF token published in a web page (<meta name="csrf_token" content="...">)
+page_csrf() {
+    python3 -c '
+import re, sys
+tokens = re.findall(r"<meta name=\"csrf_token\" content=\"([^\"]+)\"", sys.stdin.read())
+sys.stdout.write(tokens[-1] if tokens else "")
+' | tr -cd '[:alnum:]'
+}
+
+base64_text() {
+    printf '%s' "$1" | python3 -c '
+import sys, base64
+sys.stdout.write(base64.b64encode(sys.stdin.buffer.read()).decode("ascii"))
+'
+}
+
+random_hex32() {
+    python3 -c 'import secrets; print(secrets.token_hex(32), end="")'
+}
+
+# SCRAM login proof used by recent Huawei web interfaces.
+# Arguments: salt (hex), iterations, client nonce, server nonce.
+# Prints "<client_proof> <expected_server_signature>". The password is read from
+# stdin, never passed on the command line.
+# Note: Huawei swaps the HMAC key and message compared to RFC 5802, exactly as
+# the router's own JavaScript does.
+scram_proof() {
+    printf '%s' "$PASSWORD" | python3 -c '
+import sys, hashlib, hmac
+salt, iterations = bytes.fromhex(sys.argv[1]), int(sys.argv[2])
+first, server = sys.argv[3], sys.argv[4]
+auth = ("%s,%s,%s" % (first, server, server)).encode()
+salted = hashlib.pbkdf2_hmac("sha256", sys.stdin.buffer.read(), salt, iterations, 32)
+client_key = hmac.new(b"Client Key", salted, hashlib.sha256).digest()
+stored_key = hashlib.sha256(client_key).digest()
+signature = hmac.new(auth, stored_key, hashlib.sha256).digest()
+proof = bytes(a ^ b for a, b in zip(client_key, signature)).hex()
+server_key = hmac.new(b"Server Key", salted, hashlib.sha256).digest()
+print(proof, hmac.new(auth, server_key, hashlib.sha256).hexdigest())
+' "$1" "$2" "$3" "$4"
+}
+
 # Print the router's error code from an API answer, if any
 error_code() {
     xml_tag code
@@ -159,6 +201,8 @@ error_code() {
 # -----------------------------------------------------------------------------
 
 COOKIE_JAR=""
+HEADERS=""
+CSRF=""
 LOGGED_IN=0
 
 CURL_OPTIONS=(
@@ -172,9 +216,10 @@ api_get() {
     curl "${CURL_OPTIONS[@]}" -b "$COOKIE_JAR" -c "$COOKIE_JAR" "$ROUTER_URL$1" 2>/dev/null
 }
 
+# POST an XML request; the answer headers are kept in $HEADERS
 api_post() {
     local path="$1" token="$2" body="$3"
-    curl "${CURL_OPTIONS[@]}" -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    curl "${CURL_OPTIONS[@]}" -b "$COOKIE_JAR" -c "$COOKIE_JAR" -D "$HEADERS" \
         -H "__RequestVerificationToken: $token" \
         -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" \
         -X POST "$ROUTER_URL$path" \
@@ -184,6 +229,14 @@ api_post() {
 # A fresh anti-CSRF token is required before each POST request
 fresh_token() {
     api_get "/api/webserver/token" | xml_tag token
+}
+
+# New anti-CSRF token sent back by the router with the last POST answer, if any
+header_token() {
+    awk -F': *' '
+        { name = tolower($1) }
+        name == "__requestverificationtoken" || name == "__requestverificationtokenone" { print $2; exit }
+    ' "$HEADERS" 2>/dev/null | tr -d '\r' | cut -d'#' -f1
 }
 
 logout() {
@@ -202,61 +255,129 @@ logout() {
 cleanup() {
     logout
     [[ -n "$COOKIE_JAR" ]] && rm -f -- "$COOKIE_JAR"
+    [[ -n "$HEADERS" ]] && rm -f -- "$HEADERS"
 }
 
-login() {
-    [[ -n "$PASSWORD" ]] || fail "no password configured (set HUAWEI_PASSWORD or edit $CONFIG_FILE)"
-
-    COOKIE_JAR="$(mktemp)"
-    trap cleanup EXIT
-
-    log "Connecting to $ROUTER_URL..."
-
-    local page csrf
-    page="$(curl "${CURL_OPTIONS[@]}" -c "$COOKIE_JAR" "$ROUTER_URL/html/home.html" 2>/dev/null)" \
+# Open a web session: session cookie + anti-CSRF token in $CSRF
+open_session() {
+    local page
+    page="$(curl "${CURL_OPTIONS[@]}" -b "$COOKIE_JAR" -c "$COOKIE_JAR" "$ROUTER_URL/html/home.html" 2>/dev/null)" \
         || fail "router unreachable at $ROUTER_URL (powered off, cable, network?)"
 
     awk '$6 == "SessionID" { found = 1 } END { exit !found }' "$COOKIE_JAR" \
         || fail "the router did not open a session"
 
-    # The anti-CSRF token is published in the home page (<meta name="csrf_token">).
-    # Some firmwares only publish it through /api/webserver/SesTokInfo.
-    csrf="$(printf '%s' "$page" | python3 -c '
-import re, sys
-tokens = re.findall(r"<meta name=\"csrf_token\" content=\"([^\"]+)\"", sys.stdin.read())
-sys.stdout.write(tokens[-1] if tokens else "")
-' | tr -cd '[:alnum:]')"
-    if [[ -z "$csrf" ]]; then
-        csrf="$(api_get "/api/webserver/SesTokInfo" | xml_tag TokInfo)"
+    # Most firmwares publish the token in the home page; some only through SesTokInfo.
+    CSRF="$(printf '%s' "$page" | page_csrf)"
+    if [[ -z "$CSRF" ]]; then
+        CSRF="$(api_get "/api/webserver/SesTokInfo" | xml_tag TokInfo)"
     fi
-    [[ -n "$csrf" ]] || fail "anti-CSRF token not found"
-    ok "Session opened"
+    [[ -n "$CSRF" ]] || fail "anti-CSRF token not found"
+}
 
-    local password_hash login_hash body answer
-    password_hash="$(sha256_hex_base64 "$PASSWORD")"
-    login_hash="$(sha256_hex_base64 "${USERNAME}${password_hash}${csrf}")"
+login_refused() {
+    local code
+    code="$(printf '%s' "$1" | error_code)"
+    case "$code" in
+        108001|108002|108006) fail "login refused: wrong username or password (code $code)" ;;
+        108003|108005)        fail "login refused: another session is already open (code $code)" ;;
+        108007)               fail "login refused: too many attempts, try again later (code $code)" ;;
+        115002)               fail "login refused: the router asks to change the default password first (code $code)" ;;
+        *)                    fail "login refused (code ${code:-unknown})" ;;
+    esac
+}
+
+# Classic login (POST /api/user/login).
+#   password_type 4    : base64(sha256hex(username + base64(sha256hex(password)) + token))
+#   password_type 0, 3 : base64(password)   (older firmwares)
+classic_login() {
+    local type="$1" password body answer
+    if [[ "$type" == "4" ]]; then
+        password="$(sha256_hex_base64 "${USERNAME}$(sha256_hex_base64 "$PASSWORD")${CSRF}")"
+    else
+        password="$(base64_text "$PASSWORD")"
+    fi
     body="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <request>
     <Username>$(xml_escape "$USERNAME")</Username>
-    <Password>$login_hash</Password>
-    <password_type>4</password_type>
+    <Password>$password</Password>
+    <password_type>$type</password_type>
 </request>"
 
-    answer="$(api_post "/api/user/login" "$csrf" "$body")" \
+    answer="$(api_post "/api/user/login" "$CSRF" "$body")" \
         || fail "no answer from the router during login"
+    printf '%s' "$answer" | grep -q "<response>OK</response>" || login_refused "$answer"
+}
 
-    if ! printf '%s' "$answer" | grep -q "<response>OK</response>"; then
-        local code
-        code="$(printf '%s' "$answer" | error_code)"
-        case "$code" in
-            108001|108002|108006) fail "login refused: wrong username or password (code $code)" ;;
-            108003|108005)        fail "login refused: another session is already open (code $code)" ;;
-            108007)               fail "login refused: too many attempts, try again later (code $code)" ;;
-            *)             fail "login refused (code ${code:-unknown})" ;;
-        esac
+# SCRAM login (challenge_login + authentication_login) used by recent web
+# interfaces. Returns 1 if the router does not offer it.
+scram_login() {
+    local first answer salt iterations server token proof expected received
+    first="$(random_hex32)"
+    answer="$(api_post "/api/user/challenge_login" "$CSRF" "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<request>
+    <username>$(xml_escape "$USERNAME")</username>
+    <firstnonce>$first</firstnonce>
+    <mode>1</mode>
+</request>")" || return 1
+
+    salt="$(printf '%s' "$answer" | xml_tag salt)"
+    iterations="$(printf '%s' "$answer" | xml_tag iterations)"
+    server="$(printf '%s' "$answer" | xml_tag servernonce)"
+    [[ -n "$salt" && -n "$iterations" && -n "$server" ]] || return 1
+
+    read -r proof expected <<< "$(scram_proof "$salt" "$iterations" "$first" "$server")"
+    [[ -n "$proof" ]] || fail "could not compute the SCRAM login (OpenSSL 3.0+ or python3 needed)"
+
+    token="$(header_token)"
+    [[ -n "$token" ]] || token="$(fresh_token)"
+    answer="$(api_post "/api/user/authentication_login" "$token" "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<request>
+    <clientproof>$proof</clientproof>
+    <finalnonce>$server</finalnonce>
+</request>")" || fail "no answer from the router during login"
+
+    received="$(printf '%s' "$answer" | xml_tag serversignature)"
+    [[ -n "$received" ]] || login_refused "$answer"
+    [[ "$received" == "$expected" ]] || fail "login aborted: the router's identity could not be verified"
+}
+
+login() {
+    COOKIE_JAR="$(mktemp)"
+    HEADERS="$(mktemp)"
+    trap cleanup EXIT
+
+    log "Connecting to $ROUTER_URL..."
+    open_session
+    ok "Session opened"
+
+    # Which login does this firmware expect?
+    local state logged type
+    state="$(api_get "/api/user/state-login")"
+    logged="$(printf '%s' "$state" | xml_tag State)"
+    type="$(printf '%s' "$state" | xml_tag password_type)"
+
+    if [[ "$logged" == "0" ]]; then
+        ok "No login needed (device without password, or session already open)"
+        return 0
     fi
+
+    [[ -n "$PASSWORD" ]] || fail "no password configured (set HUAWEI_PASSWORD or edit $CONFIG_FILE)"
+
+    if [[ "$type" == "4" || -z "$type" ]]; then
+        if scram_login; then
+            LOGGED_IN=1
+            ok "Logged in as $USERNAME (SCRAM)"
+            return 0
+        fi
+        # SCRAM not offered: start again with a clean session for the classic login
+        open_session
+        type=4
+    fi
+
+    classic_login "$type"
     LOGGED_IN=1
-    ok "Logged in as $USERNAME"
+    ok "Logged in as $USERNAME (password type $type)"
 }
 
 # -----------------------------------------------------------------------------

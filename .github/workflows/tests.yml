@@ -1,0 +1,28 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  ubuntu:
+    name: Ubuntu (GNU tools)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        run: shellcheck --severity=warning rthexplorer.sh rthexplorer_bash.sh tests/run_tests.sh
+      - name: Tests against a simulated Huawei router
+        run: bash tests/run_tests.sh
+
+  alpine:
+    name: Alpine (BusyBox tools)
+    runs-on: ubuntu-latest
+    container: alpine:3.20
+    steps:
+      - name: Install requirements
+        run: apk add --no-cache bash curl python3 openssl
+      - uses: actions/checkout@v4
+      - name: Tests against a simulated Huawei router
+        run: bash tests/run_tests.sh

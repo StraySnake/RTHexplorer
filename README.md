@@ -104,6 +104,8 @@ HUAWEI_PASSWORD='my router password' ./rthexplorer.sh status
 rthexplorer.sh send <number> [<number>...] <message>   Send an SMS (one login for all numbers)
 rthexplorer.sh inbox                                   Print unread received SMS, mark them read
 rthexplorer.sh status                                  Check the router (no SMS sent)
+rthexplorer.sh cleanup                                 Delete read and sent SMS (keeps unread ones)
+rthexplorer.sh reboot                                  Restart the router
 rthexplorer.sh help                                    Show help
 ```
 
@@ -156,7 +158,27 @@ Run it every minute (cron, home automation…) to **control things by SMS** — 
 ./rthexplorer.sh status
 ```
 
-It logs in, reads the SIM card state, the mobile network and the signal strength, then logs out. Ideal for a daily health check: you learn that SMS alerts are broken **before** you need them.
+It logs in, reads the SIM card state, the mobile network, the signal (bars, RSRP, SINR, RSSI), the data connection and the SMS storage, then logs out. Ideal for a health check or for monitoring graphs: you learn that SMS alerts are broken **before** you need them.
+
+```text
+STATUS=OK;SIGNAL=4/5;OPERATOR=Orange F;NETWORK=4G;INTERNET=connected;RSRP=-95;SINR=12;RSSI=-65;SMS_STORED=12;SMS_MAX=500
+```
+
+### Keep the SMS storage clean
+
+```bash
+./rthexplorer.sh cleanup
+```
+
+Deletes the SMS that were already read and all sent SMS; **unread SMS are kept**. Routers stop sending or receiving SMS when their storage is full — run it weekly (`STATUS=OK;DELETED=12`).
+
+### Restart the router
+
+```bash
+./rthexplorer.sh reboot
+```
+
+Useful for automatic recovery when `status` keeps reporting no network. The router is unreachable for 1 to 2 minutes afterwards.
 
 ### Rate limit
 
@@ -179,7 +201,9 @@ Exactly **one result line** is written to **stdout**, easy to parse:
 | Situation | stdout |
 |---|---|
 | SMS sent | `STATUS=OK;SMS=sent;SENT=2/2` |
-| Router healthy | `STATUS=OK;SIGNAL=4/5;OPERATOR=Orange F` |
+| Router healthy | `STATUS=OK;SIGNAL=4/5;OPERATOR=Orange F;NETWORK=4G;INTERNET=connected;RSRP=-95;SINR=12;RSSI=-65;SMS_STORED=12;SMS_MAX=500` |
+| Storage cleaned | `STATUS=OK;DELETED=12` |
+| Restart requested | `STATUS=OK;REBOOT=requested` |
 | Inbox read | `STATUS=OK;COUNT=1` (after one JSON line per message) |
 | Some numbers refused | `STATUS=ERROR;DETAIL=SMS refused for +336… (code …);SENT=1/2` |
 | Rate limit reached | `STATUS=ERROR;DETAIL=rate limit reached (20 SMS per 3600 s);SENT=0/2;LIMITED=1` |
@@ -343,7 +367,7 @@ Please [open an issue](https://github.com/StraySnake/RTHexplorer/issues) with yo
    - Base64: `POST /api/user/login` with `base64(password)`
    - No password: nothing to do
 4. Get a fresh token: `GET /api/webserver/token`
-5. `send` → `POST /api/sms/send-sms` (once per number, same session) · `inbox` → `POST /api/sms/sms-list` then `POST /api/sms/set-read` · `status` → `GET /api/monitoring/status` and `GET /api/net/current-plmn`
+5. `send` → `POST /api/sms/send-sms` (once per number, same session) · `inbox` → `POST /api/sms/sms-list` then `POST /api/sms/set-read` · `status` → `GET /api/monitoring/status`, `/api/net/current-plmn`, `/api/device/signal`, `/api/sms/sms-count` · `cleanup` → `POST /api/sms/sms-list` then `POST /api/sms/delete-sms` · `reboot` → `POST /api/device/control`
 6. Log out: `POST /api/user/logout`
 
 ## License

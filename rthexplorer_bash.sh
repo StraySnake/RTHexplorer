@@ -13,6 +13,8 @@
 #                                                (one login for all of them)
 #   rthexplorer_bash.sh inbox                                   Print unread received SMS, mark them read
 #   rthexplorer_bash.sh status                                  Check the router (no SMS sent)
+#   rthexplorer_bash.sh cleanup                                 Delete read and sent SMS (keeps unread ones)
+#   rthexplorer_bash.sh reboot                                  Restart the router
 #   rthexplorer_bash.sh help                                    Show help
 #
 #   <number> may be a comma-separated list, or "default" (HUAWEI_SMS_TO).
@@ -23,7 +25,9 @@
 #   Progress messages go to stderr.
 #   One machine-readable result line goes to stdout (always the last line):
 #     STATUS=OK;SMS=sent;SENT=2/2
-#     STATUS=OK;SIGNAL=4/5;OPERATOR=Orange F
+#     STATUS=OK;SIGNAL=4/5;OPERATOR=Orange F;NETWORK=4G;INTERNET=connected;RSRP=-95;SINR=12;RSSI=-65;SMS_STORED=12;SMS_MAX=500
+#     STATUS=OK;DELETED=12      (cleanup)
+#     STATUS=OK;REBOOT=requested
 #     STATUS=OK;COUNT=1          (inbox: preceded by one JSON line per message)
 #     STATUS=ERROR;DETAIL=<human readable reason>[;SENT=1/2][;LIMITED=1]
 #
@@ -88,6 +92,8 @@ Usage:
   $(basename "$0") send <number> [<number>...] <message>   Send an SMS (one login for all numbers)
   $(basename "$0") inbox                                   Print unread SMS as JSON lines, mark them read
   $(basename "$0") status                                  Check the router (no SMS sent)
+  $(basename "$0") cleanup                                 Delete read and sent SMS (keeps unread ones)
+  $(basename "$0") reboot                                  Restart the router
   $(basename "$0") help                                    Show this help
 
   <number>  +33612345678, a comma-separated list, or "default" (HUAWEI_SMS_TO)
@@ -428,24 +434,164 @@ login() {
 # Commands
 # -----------------------------------------------------------------------------
 
-# Read-only check: login, SIM, mobile network, signal. No SMS is sent.
+# Network generation from Huawei network type codes
+network_name() {
+    local code="$1"
+    case "$code" in
+        "")                       echo "unknown" ;;
+        0)                        echo "none" ;;
+        1|2|3)                    echo "2G" ;;
+        19|101|1011)              echo "4G" ;;
+        111|1101|1111|1121)       echo "5G" ;;
+        *)
+            if [[ "$code" =~ ^[0-9]+$ && "$code" -ge 4 && "$code" -le 18 ]]; then
+                echo "3G"
+            else
+                echo "type $code"
+            fi
+            ;;
+    esac
+}
+
+# Keep only the number of a value such as "-95dBm" or ">=-51dBm"
+number_only() {
+    printf '%s' "$1" | tr -cd '0-9.-'
+}
+
+# Whole number of a value, 0 if missing
+to_int() {
+    local value
+    value="$(printf '%s' "$1" | tr -cd '0-9')"
+    echo "${value:-0}"
+}
+
+# Read-only check: login, SIM, mobile network, signal, data connection,
+# SMS storage. No SMS is sent.
 cmd_status() {
     login
 
-    local status plmn sim signal operator
+    local status plmn signal_info sms_count
     status="$(api_get "/api/monitoring/status")" || fail "cannot read the router status"
     plmn="$(api_get "/api/net/current-plmn")" || plmn=""
+    signal_info="$(api_get "/api/device/signal")" || signal_info=""
+    sms_count="$(api_get "/api/sms/sms-count")" || sms_count=""
 
+    local sim signal operator type network connection internet rsrp sinr rssi stored max
     sim="$(printf '%s' "$status" | xml_tag SimStatus)"
     signal="$(printf '%s' "$status" | xml_tag SignalIcon)"
     operator="$(printf '%s' "$plmn" | xml_tag ShortName)"
     [[ -n "$operator" ]] || operator="$(printf '%s' "$plmn" | xml_tag FullName)"
 
+    type="$(printf '%s' "$status" | xml_tag CurrentNetworkTypeEx)"
+    [[ -n "$type" ]] || type="$(printf '%s' "$status" | xml_tag CurrentNetworkType)"
+    network="$(network_name "$type")"
+
+    connection="$(printf '%s' "$status" | xml_tag ConnectionStatus)"
+    case "$connection" in
+        901) internet="connected" ;;
+        900) internet="connecting" ;;
+        "")  internet="unknown" ;;
+        *)   internet="disconnected" ;;
+    esac
+
+    rsrp="$(number_only "$(printf '%s' "$signal_info" | xml_tag rsrp)")"
+    sinr="$(number_only "$(printf '%s' "$signal_info" | xml_tag sinr)")"
+    rssi="$(number_only "$(printf '%s' "$signal_info" | xml_tag rssi)")"
+
+    stored=$(( $(to_int "$(printf '%s' "$sms_count" | xml_tag LocalInbox)") \
+             + $(to_int "$(printf '%s' "$sms_count" | xml_tag LocalOutbox)") ))
+    max="$(number_only "$(printf '%s' "$sms_count" | xml_tag LocalMax)")"
+
     [[ "$sim" == "1" ]] || fail "SIM card missing, locked or waiting for PIN (SimStatus=${sim:-?})"
     [[ -n "$signal" && "$signal" != "0" ]] || fail "no mobile network (signal 0/5)"
 
-    ok "SIM ready, signal ${signal}/5, operator ${operator:-unknown}"
-    echo "STATUS=OK;SIGNAL=${signal}/5;OPERATOR=${operator:-unknown}"
+    ok "SIM ready, signal ${signal}/5, ${network}, operator ${operator:-unknown}, data ${internet}"
+    echo "STATUS=OK;SIGNAL=${signal}/5;OPERATOR=${operator:-unknown};NETWORK=${network};INTERNET=${internet};RSRP=${rsrp};SINR=${sinr};RSSI=${rssi};SMS_STORED=${stored};SMS_MAX=${max}"
+    exit 0
+}
+
+# --- Maintenance ----------------------------------------------------------------
+
+# Print "<index> <read>" for each message of one page of a box (1 = received, 2 = sent).
+# <read> is 1 for read messages, 0 for unread ones. Returns 1 on error.
+list_page() {
+    local box="$1" page="$2" token answer line index read
+    token="$(fresh_token)" || token=""
+    [[ -n "$token" ]] || return 1
+    answer="$(api_post "/api/sms/sms-list" "$token" "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<request>
+    <PageIndex>$page</PageIndex>
+    <ReadCount>50</ReadCount>
+    <BoxType>$box</BoxType>
+    <SortType>0</SortType>
+    <Ascending>1</Ascending>
+    <UnreadPreferred>0</UnreadPreferred>
+</request>")" || return 1
+    printf '%s' "$answer" | grep -q "<error>" && return 1
+    answer="${answer//$'\r'/ }"
+    answer="${answer//$'\n'/ }"
+    answer="${answer//<\/Message>/$'\n'}"
+    while IFS= read -r line; do
+        [[ "$line" =~ \<Index\>([^<]*)\</Index\> ]] || continue
+        index="${BASH_REMATCH[1]}"
+        read=1
+        [[ "$line" =~ \<Smstat\>0\</Smstat\> ]] && read=0
+        echo "$index $read"
+    done <<< "$answer"
+}
+
+# Delete read received SMS and all sent SMS (unread messages are kept),
+# so the router storage never gets full.
+cmd_cleanup() {
+    login
+
+    local -a to_delete=()
+    local box page lines index read count
+    for box in 1 2; do
+        for (( page = 1; page <= 20; page++ )); do
+            lines="$(list_page "$box" "$page")" || fail "cannot read the SMS list (box $box)"
+            count=0
+            while read -r index read; do
+                [[ -n "$index" ]] || continue
+                count=$(( count + 1 ))
+                if [[ "$box" == "2" || "$read" == "1" ]]; then
+                    to_delete+=("$index")
+                fi
+            done <<< "$lines"
+            [[ "$count" -ge 50 ]] || break
+        done
+    done
+
+    local deleted=0 token answer
+    for index in "${to_delete[@]}"; do
+        token="$(fresh_token)" || token=""
+        [[ -n "$token" ]] || continue
+        answer="$(api_post "/api/sms/delete-sms" "$token" \
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><request><Index>$index</Index></request>")" || continue
+        printf '%s' "$answer" | grep -q "<response>OK</response>" && deleted=$(( deleted + 1 ))
+    done
+
+    ok "$deleted SMS deleted (unread received SMS kept)"
+    echo "STATUS=OK;DELETED=$deleted"
+    exit 0
+}
+
+# Restart the router. It is unreachable for about 1 to 2 minutes afterwards.
+cmd_reboot() {
+    login
+
+    local token answer
+    token="$(fresh_token)" || token=""
+    [[ -n "$token" ]] || fail "cannot get a token to restart the router"
+    answer="$(api_post "/api/device/control" "$token" \
+        '<?xml version="1.0" encoding="UTF-8"?><request><Control>1</Control></request>')" \
+        || fail "no answer from the router"
+    printf '%s' "$answer" | grep -q "<response>OK</response>" \
+        || fail "restart refused by the router (code $(printf '%s' "$answer" | error_code))"
+
+    LOGGED_IN=0     # the router is going down: no logout
+    ok "Router restarting"
+    echo "STATUS=OK;REBOOT=requested"
     exit 0
 }
 
@@ -657,6 +803,12 @@ case "${1:-}" in
         ;;
     inbox)
         cmd_inbox
+        ;;
+    cleanup)
+        cmd_cleanup
+        ;;
+    reboot)
+        cmd_reboot
         ;;
     send)
         shift

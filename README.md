@@ -176,5 +176,9 @@ How it works
 
 License
 
-MIT — see LICENSE.
+Copyright (C) 2026 StraySnake
+
+RTHexplorer is free software, released under the GNU General Public License v3.0 or later — see LICENSE.
+
+You may use, study, modify and share it. If you distribute a modified version, it must stay under the GPL and its source code must be made available.
 

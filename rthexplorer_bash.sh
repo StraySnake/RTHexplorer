@@ -42,6 +42,9 @@
 #   HUAWEI_USERNAME     default: admin
 #   HUAWEI_PASSWORD     required (unless the device has no login)
 #   HUAWEI_SMS_TO       default recipients for "send default", comma-separated
+#   HUAWEI_SMS_TO_FILE  file with more default recipients (one per line or comma-separated),
+#                       default: rthexplorer.recipients next to this script. Lets another
+#                       program (e.g. a home automation UI) manage the list.
 #   HUAWEI_SMS_LIMIT    max SMS per window, 0 = no limit (default: 0)
 #   HUAWEI_SMS_WINDOW   rate limit window in seconds (default: 3600)
 #   HUAWEI_STATE_FILE   where sent SMS are counted, default: .rthexplorer_sent next to this script
@@ -101,7 +104,7 @@ Usage:
 
 Configuration: $CONFIG_FILE
   or environment variables HUAWEI_ROUTER_URL, HUAWEI_USERNAME, HUAWEI_PASSWORD,
-  HUAWEI_SMS_TO, HUAWEI_SMS_LIMIT, HUAWEI_SMS_WINDOW, HUAWEI_STATE_FILE
+  HUAWEI_SMS_TO, HUAWEI_SMS_TO_FILE, HUAWEI_SMS_LIMIT, HUAWEI_SMS_WINDOW, HUAWEI_STATE_FILE
 EOF
 }
 
@@ -142,6 +145,8 @@ ROUTER_URL="${ROUTER_URL%/}"
 USERNAME="${USERNAME:-admin}"
 
 SMS_TO="${HUAWEI_SMS_TO:-$(read_config_value HUAWEI_SMS_TO)}"
+SMS_TO_FILE="${HUAWEI_SMS_TO_FILE:-$(read_config_value HUAWEI_SMS_TO_FILE)}"
+SMS_TO_FILE="${SMS_TO_FILE:-$SCRIPT_DIR/rthexplorer.recipients}"
 SMS_LIMIT="${HUAWEI_SMS_LIMIT:-$(read_config_value HUAWEI_SMS_LIMIT)}"
 SMS_WINDOW="${HUAWEI_SMS_WINDOW:-$(read_config_value HUAWEI_SMS_WINDOW)}"
 STATE_FILE="${HUAWEI_STATE_FILE:-$(read_config_value HUAWEI_STATE_FILE)}"
@@ -666,7 +671,11 @@ cmd_send() {
 
     # Recipients: each argument but the last; commas and "default" are expanded
     for arg in "${@:1:$#-1}"; do
-        [[ "$arg" == "default" ]] && arg="$SMS_TO"
+        # "default" = HUAWEI_SMS_TO + the numbers of the recipients file
+        if [[ "$arg" == "default" ]]; then
+            arg="$SMS_TO"
+            [[ -r "$SMS_TO_FILE" ]] && arg+=",$(tr '\n\r' ',,' < "$SMS_TO_FILE")"
+        fi
         IFS=',' read -r -a parts <<< "$arg"
         for number in "${parts[@]}"; do
             number="${number//[[:space:]]/}"
@@ -674,7 +683,7 @@ cmd_send() {
             [[ " ${recipients[*]} " == *" $number "* ]] || recipients+=("$number")
         done
     done
-    [[ ${#recipients[@]} -gt 0 ]] || fail "no recipient (give a number, or set HUAWEI_SMS_TO for \"default\")"
+    [[ ${#recipients[@]} -gt 0 ]] || fail "no recipient (give a number, or set HUAWEI_SMS_TO / $SMS_TO_FILE for \"default\")"
 
     if [[ "$message" == "-" ]]; then
         message="$(cat)"

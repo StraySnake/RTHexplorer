@@ -77,6 +77,7 @@ Settings are read from a config file and/or environment variables. **Environment
 | `HUAWEI_USERNAME` | `admin` | Router administrator account |
 | `HUAWEI_PASSWORD` | *(required)* | Router administrator password (not needed on devices without login) |
 | `HUAWEI_SMS_TO` | *(empty)* | Default recipients for `send default`, comma-separated |
+| `HUAWEI_SMS_TO_FILE` | `rthexplorer.recipients` next to the script | More default recipients, one per line (or comma-separated). Lets another program — a home automation UI, a web form — manage the list. Merged with `HUAWEI_SMS_TO`, duplicates removed. |
 | `HUAWEI_SMS_LIMIT` | `0` (no limit) | Maximum number of SMS per window |
 | `HUAWEI_SMS_WINDOW` | `3600` | Rate limit window, in seconds |
 | `HUAWEI_STATE_FILE` | `.rthexplorer_sent` next to the script | File used to count sent SMS |
@@ -109,7 +110,7 @@ rthexplorer.sh reboot                                  Restart the router
 rthexplorer.sh help                                    Show help
 ```
 
-- `<number>`: an international number such as `+33612345678`, a comma-separated list, or `default` (the numbers of `HUAWEI_SMS_TO`).
+- `<number>`: an international number such as `+33612345678`, a comma-separated list, or `default` (the numbers of `HUAWEI_SMS_TO` and of the recipients file).
 - `<message>`: the text, or `-` to read it from **stdin**.
 - A short form is also accepted for compatibility: `rthexplorer.sh <number> <message>`.
 

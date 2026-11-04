@@ -212,14 +212,22 @@ The anti-CSRF token is read from the home page (`<meta name="csrf_token">`) or, 
 
 ### Devices
 
-The models below are known to expose this same HiLink API (device list from the [huawei-lte-api](https://github.com/Salamek/huawei-lte-api) project). RTHexplorer itself has been used on the author's router; the other models have **not** been individually tested with this script — **reports are welcome**.
+**✅ Tested with RTHexplorer**
+
+| Model | Type | Login method | Result |
+|---|---|---|---|
+| **B525s-23a** | 4G/LTE router | SHA-256 (`password_type 4`) | `send` and `status` working (author's device) |
+
+**Expected to work**
+
+The models below are known to expose this same HiLink API (device list from the [huawei-lte-api](https://github.com/Salamek/huawei-lte-api) project). They have **not** been individually tested with this script yet — **reports are welcome**.
 
 **4G/LTE routers**
 
 | Series | Models |
 |---|---|
 | B31x | B310s-22, B311-221, B315s-22 |
-| B5xx | B525s-23a, B525s-65a, B528s, B535-232, SoyeaLink B535-333 |
+| B5xx | B525s-23a ✅, B525s-65a, B528s, B535-232, SoyeaLink B535-333 |
 | B6xx | B612-233, B628-265 |
 | B7xx / B8xx | B715s-23c, B818-263 |
 | E51xx (home routers) | E5180s-22, E5186s-22a |

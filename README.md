@@ -1,5 +1,7 @@
 # RTHexplorer
 
+[![Tests](https://github.com/StraySnake/RTHexplorer/actions/workflows/tests.yml/badge.svg)](https://github.com/StraySnake/RTHexplorer/actions/workflows/tests.yml)
+
 Send SMS and check the status of a **Huawei 4G/LTE router** from the command line — using only the router's local web API.
 
 - **No cloud, no app, no extra software on the router**: it talks to the same local API as the router's web page.
@@ -25,6 +27,7 @@ Typical uses: alerts from security cameras or home automation, server monitoring
 - [Troubleshooting](#troubleshooting)
 - [Security notes](#security-notes)
 - [How it works](#how-it-works)
+- [Tests](#tests)
 - [License](#license)
 
 ---
@@ -370,6 +373,19 @@ Please [open an issue](https://github.com/StraySnake/RTHexplorer/issues) with yo
 4. Get a fresh token: `GET /api/webserver/token`
 5. `send` → `POST /api/sms/send-sms` (once per number, same session) · `inbox` → `POST /api/sms/sms-list` then `POST /api/sms/set-read` · `status` → `GET /api/monitoring/status`, `/api/net/current-plmn`, `/api/device/signal`, `/api/sms/sms-count` · `cleanup` → `POST /api/sms/sms-list` then `POST /api/sms/delete-sms` · `reboot` → `POST /api/device/control`
 6. Log out: `POST /api/user/logout`
+
+## Tests
+
+Both scripts are tested automatically on every change, on Ubuntu and on Alpine (BusyBox tools), against a **simulated Huawei router** — no real router, SIM card or SMS needed. The simulator reproduces every supported login method (SHA-256, SCRAM, base64, no login…), errors (missing SIM, wrong password, refused number) and the SMS storage.
+
+Run them locally:
+
+```bash
+bash tests/run_tests.sh                       # both scripts
+bash tests/run_tests.sh rthexplorer_bash.sh   # one script
+```
+
+Requirements: `bash`, `curl`, `python3`, `openssl`. Please add a test when you fix a bug or support a new device.
 
 ## License
 

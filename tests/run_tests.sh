@@ -42,12 +42,22 @@ start_router() {
     local mode="$1" port=$(( NEXT_PORT++ ))
     LOGS="$WORK/router-$port"
     mkdir -p "$LOGS"
-    python3 "$HERE/mock_router.py" "$mode" "$port" "$WORK/cert.pem" "$WORK/key.pem" "$LOGS" &
+    python3 -u "$HERE/mock_router.py" "$mode" "$port" "$WORK/cert.pem" "$WORK/key.pem" "$LOGS" \
+        2> "$LOGS/stderr.log" &
     PIDS+=($!)
-    for _ in $(seq 1 50); do
-        curl -ks "https://127.0.0.1:$port/html/home.html" >/dev/null 2>&1 && break
+    local ready=0
+    for _ in $(seq 1 100); do
+        if curl -ks --noproxy '*' "https://127.0.0.1:$port/html/home.html" >/dev/null 2>&1; then
+            ready=1
+            break
+        fi
         sleep 0.1
     done
+    if (( ready == 0 )); then
+        echo "  !!    simulated router ($mode) not reachable on port $port"
+        curl -kvs --noproxy '*' "https://127.0.0.1:$port/html/home.html" 2>&1 | sed 's/^/        curl: /' | head -20
+        sed 's/^/        mock: /' "$LOGS/stderr.log"
+    fi
     ROUTER="https://127.0.0.1:$port"
 }
 

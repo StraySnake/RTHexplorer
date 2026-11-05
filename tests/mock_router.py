@@ -87,7 +87,12 @@ class Router(http.server.BaseHTTPRequestHandler):
         pass
 
     def reply(self, body, cookie=False, token=None, session=None):
+        data = body.encode()
         self.send_response(200)
+        # Explicit length: without it, recent curl versions reject a TLS connection
+        # closed without close_notify ("unexpected eof")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Type", "text/xml; charset=UTF-8")
         if cookie:
             self.send_header("Set-Cookie", "SessionID=abc123; path=/")
         if session:
@@ -95,7 +100,7 @@ class Router(http.server.BaseHTTPRequestHandler):
         if token:
             self.send_header("__RequestVerificationToken", token)
         self.end_headers()
-        self.wfile.write(body.encode())
+        self.wfile.write(data)
 
     def stolen(self):
         """single mode: is this request using a session replaced by a newer login?"""

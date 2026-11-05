@@ -55,7 +55,7 @@ start_router() {
     done
     if (( ready == 0 )); then
         echo "  !!    simulated router ($mode) not reachable on port $port"
-        curl -kvs --noproxy '*' "https://127.0.0.1:$port/html/home.html" 2>&1 | sed 's/^/        curl: /' | head -20
+        curl -kvs --noproxy '*' "https://127.0.0.1:$port/html/home.html" 2>&1 | grep -v '^[{}] \[' | sed 's/^/        curl: /' | tail -12
         sed 's/^/        mock: /' "$LOGS/stderr.log"
     fi
     ROUTER="https://127.0.0.1:$port"

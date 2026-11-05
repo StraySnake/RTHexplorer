@@ -13,6 +13,9 @@ Modes (login behaviour of the simulated firmware):
   sestok   token only published by /api/webserver/SesTokInfo
   nosim    SIM card missing
   badpw    every login is refused
+  single   one session at a time, like real routers: a new login invalidates
+           the previous session (error 125003) — tests the lock between runs
+  flaky    the first login is rejected with 125003 (session error), then OK
 
 Expected credentials: admin / p@ss w0rd"x (a space and a quote, to test escaping).
 Sent SMS are appended to <logdir>/sent.log as "<phone>|<content>|<length>",
@@ -34,8 +37,13 @@ TOKEN = "TOK123"
 SALT, ITERATIONS = "a1b2c3d4e5f60718", 100
 REFUSED_PHONE = "+33699999999"
 
+import time
+
 state = {
     "logged": False,
+    "session": "",
+    "sessions": 0,
+    "flaky_done": False,
     "first_nonce": "",
     # box 1 = received (index: read flag), box 2 = sent
     "boxes": {
@@ -78,14 +86,22 @@ class Router(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-    def reply(self, body, cookie=False, token=None):
+    def reply(self, body, cookie=False, token=None, session=None):
         self.send_response(200)
         if cookie:
             self.send_header("Set-Cookie", "SessionID=abc123; path=/")
+        if session:
+            self.send_header("Set-Cookie", f"SessionID={session}; path=/")
         if token:
             self.send_header("__RequestVerificationToken", token)
         self.end_headers()
         self.wfile.write(body.encode())
+
+    def stolen(self):
+        """single mode: is this request using a session replaced by a newer login?"""
+        if MODE != "single" or not state["session"]:
+            return False
+        return f"SessionID={state['session']}" not in (self.headers.get("Cookie") or "")
 
     def error(self, code):
         self.reply(f"<error><code>{code}</code><message></message></error>")
@@ -107,6 +123,8 @@ class Router(http.server.BaseHTTPRequestHandler):
             return self.reply(f"<response><State>{logged}</State><password_type>{ptype}</password_type></response>")
         if not state["logged"] and MODE != "nologin":
             return self.error(100003)
+        if self.stolen():
+            return self.error(125003)
         if path == "/api/monitoring/status":
             sim = "0" if MODE == "nosim" else "1"
             return self.reply("<response><ConnectionStatus>901</ConnectionStatus>"
@@ -148,6 +166,9 @@ class Router(http.server.BaseHTTPRequestHandler):
         if path == "/api/user/login":
             if MODE in ("scram", "badpw"):
                 return self.error(108006)
+            if MODE == "flaky" and not state["flaky_done"]:
+                state["flaky_done"] = True
+                return self.error(125003)
             ptype, password = tag(body, "password_type"), tag(body, "Password")
             if ptype == "4":
                 good = password == sha_b64(USERNAME + sha_b64(PASSWORD) + TOKEN)
@@ -157,15 +178,27 @@ class Router(http.server.BaseHTTPRequestHandler):
             if not good:
                 return self.error(108006)
             state["logged"] = True
+            if MODE == "single":
+                state["sessions"] += 1
+                state["session"] = f"s{state['sessions']}"
+                return self.reply("<response>OK</response>", session=state["session"])
             return self.reply("<response>OK</response>")
         if path == "/api/user/logout":
+            if self.stolen():
+                return self.error(125003)
             state["logged"] = False
             return self.reply("<response>OK</response>")
 
         if not state["logged"] and MODE != "nologin":
             return self.error(100003)
+        if self.stolen():
+            return self.error(125003)
 
         if path == "/api/sms/send-sms":
+            if MODE == "single":
+                time.sleep(0.4)   # long enough for another run to try to log in meanwhile
+                if self.stolen():
+                    return self.error(125003)
             phone = tag(body, "Phone")
             log("sent.log", f"{phone}|{tag(body, 'Content')}|{tag(body, 'Length')}")
             if phone == REFUSED_PHONE:

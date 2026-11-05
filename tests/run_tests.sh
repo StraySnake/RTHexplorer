@@ -99,6 +99,19 @@ for script_name in "${SCRIPTS[@]}"; do
     start_router sha256
     out="$(run env HUAWEI_PASSWORD= bash "$S" status)"; check "no password configured" 1 "DETAIL=no password configured" "$out" "$?"
 
+    # --- one session at a time --------------------------------------------------
+    start_router flaky
+    out="$(run bash "$S" status)"; check "session rejected once, new try succeeds" 0 "STATUS=OK;SIGNAL=4/5" "$out" "$?"
+    start_router single
+    runs=()
+    for i in 1 2 3; do
+        run env HUAWEI_LOCK_DIR="$WORK/lock" bash "$S" send "+3361111111$i" "parallel $i" > "$WORK/parallel-$i" &
+        runs+=($!)
+    done
+    wait "${runs[@]}"     # only these runs: the simulated routers keep running
+    check "3 runs at the same time wait for each other" 0 "3 sent" "$(cat "$WORK"/parallel-* | grep -c 'SENT=1/1') sent" 0
+    check "lock released after the runs" 0 "absent" "$([[ -e "$WORK/lock" ]] && echo present || echo absent)" 0
+
     # --- send -----------------------------------------------------------------
     start_router sha256
     out="$(run bash "$S" send +33611111111 'Alert <&> été')"; check "send one SMS" 0 "STATUS=OK;SMS=sent;SENT=1/1" "$out" "$?"

@@ -1,3 +1,4 @@
 rthexplorer.conf
 .rthexplorer_sent
 rthexplorer.recipients
+.rthexplorer.lock/

@@ -45,6 +45,8 @@
 #   HUAWEI_SMS_LIMIT    max SMS per window, 0 = no limit (default: 0)
 #   HUAWEI_SMS_WINDOW   rate limit window in seconds (default: 3600)
 #   HUAWEI_STATE_FILE   where sent SMS are counted, default: .rthexplorer_sent next to this script
+#   HUAWEI_LOCK_DIR     lock so that runs never use the router at the same time,
+#                       default: .rthexplorer.lock next to this script
 #   HUAWEI_CONFIG       config file, default: rthexplorer.conf next to this script
 #
 # Requirements: bash, curl, python3, awk, mktemp
@@ -154,6 +156,8 @@ STATE_FILE="${HUAWEI_STATE_FILE:-$(read_config_value HUAWEI_STATE_FILE)}"
 [[ "$SMS_LIMIT" =~ ^[0-9]+$ ]] || SMS_LIMIT=0
 [[ "$SMS_WINDOW" =~ ^[0-9]+$ && "$SMS_WINDOW" -gt 0 ]] || SMS_WINDOW=3600
 STATE_FILE="${STATE_FILE:-$SCRIPT_DIR/.rthexplorer_sent}"
+LOCK_DIR="${HUAWEI_LOCK_DIR:-$(read_config_value HUAWEI_LOCK_DIR)}"
+LOCK_DIR="${LOCK_DIR:-$SCRIPT_DIR/.rthexplorer.lock}"
 
 # -----------------------------------------------------------------------------
 # Small tools (python3 is used instead of "grep -P" or openssl, so the script
@@ -246,6 +250,7 @@ COOKIE_JAR=""
 HEADERS=""
 CSRF=""
 LOGGED_IN=0
+LAST_ANSWER=""
 
 CURL_OPTIONS=(
     --insecure              # routers use a self-signed HTTPS certificate
@@ -296,8 +301,50 @@ logout() {
 
 cleanup() {
     logout
+    release_lock
     [[ -n "$COOKIE_JAR" ]] && rm -f -- "$COOKIE_JAR"
     [[ -n "$HEADERS" ]] && rm -f -- "$HEADERS"
+}
+
+# --- One router session at a time ---------------------------------------------
+# Huawei routers accept a single web session: a second login invalidates the
+# first one (error 125002/125003). Runs of this script therefore wait for each
+# other with a lock directory. A lock older than 3 minutes is considered stale.
+
+LOCK_HELD=0
+
+acquire_lock() {
+    local waited=0
+    until mkdir "$LOCK_DIR" 2>/dev/null; do
+        if [[ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +3 2>/dev/null)" ]]; then
+            log "Removing a stale lock ($LOCK_DIR)"
+            rmdir "$LOCK_DIR" 2>/dev/null
+            continue
+        fi
+        if (( waited == 0 )); then
+            log "Another run is using the router, waiting..."
+        fi
+        if (( waited >= 90 )); then
+            fail "router busy: another run of this script did not finish within 90 s ($LOCK_DIR)"
+        fi
+        sleep 1
+        waited=$(( waited + 1 ))
+    done
+    LOCK_HELD=1
+}
+
+release_lock() {
+    if [[ "$LOCK_HELD" == "1" ]]; then
+        rmdir "$LOCK_DIR" 2>/dev/null
+        LOCK_HELD=0
+    fi
+}
+
+# Router error codes meaning "session or token rejected": worth one new try
+session_rejected() {
+    local code
+    code="$(printf '%s' "$1" | error_code)"
+    [[ "$code" == "125001" || "$code" == "125002" || "$code" == "125003" ]]
 }
 
 # Open a web session: session cookie + anti-CSRF token in $CSRF
@@ -325,6 +372,7 @@ login_refused() {
         108003|108005)        fail "login refused: another session is already open (code $code)" ;;
         108007)               fail "login refused: too many attempts, try again later (code $code)" ;;
         115002)               fail "login refused: the router asks to change the default password first (code $code)" ;;
+        125001|125002|125003) fail "login refused: session rejected by the router, another login at the same time? (code $code)" ;;
         *)                    fail "login refused (code ${code:-unknown})" ;;
     esac
 }
@@ -348,11 +396,15 @@ classic_login() {
 
     answer="$(api_post "/api/user/login" "$CSRF" "$body")" \
         || fail "no answer from the router during login"
-    printf '%s' "$answer" | grep -q "<response>OK</response>" || login_refused "$answer"
+    printf '%s' "$answer" | grep -q "<response>OK</response>" && return 0
+    LAST_ANSWER="$answer"
+    session_rejected "$answer" && return 2
+    login_refused "$answer"
 }
 
 # SCRAM login (challenge_login + authentication_login) used by recent web
-# interfaces. Returns 1 if the router does not offer it.
+# interfaces. Returns 1 if the router does not offer it, 2 if the session was
+# rejected (worth a new try).
 scram_login() {
     local first answer salt iterations server token proof expected received
     first="$(random_hex32)"
@@ -380,7 +432,11 @@ scram_login() {
 </request>")" || fail "no answer from the router during login"
 
     received="$(printf '%s' "$answer" | xml_tag serversignature)"
-    [[ -n "$received" ]] || login_refused "$answer"
+    if [[ -z "$received" ]]; then
+        LAST_ANSWER="$answer"
+        session_rejected "$answer" && return 2
+        login_refused "$answer"
+    fi
     [[ "$received" == "$expected" ]] || fail "login aborted: the router's identity could not be verified"
 }
 
@@ -388,38 +444,54 @@ login() {
     COOKIE_JAR="$(mktemp)"
     HEADERS="$(mktemp)"
     trap cleanup EXIT
+    acquire_lock
 
-    log "Connecting to $ROUTER_URL..."
-    open_session
-    ok "Session opened"
+    local attempt state logged type result
+    for attempt in 1 2; do
+        if (( attempt == 2 )); then
+            log "Session rejected by the router, new try in 2 s..."
+            sleep 2
+            : > "$COOKIE_JAR"
+        fi
+        log "Connecting to $ROUTER_URL..."
+        open_session
+        ok "Session opened"
 
-    # Which login does this firmware expect?
-    local state logged type
-    state="$(api_get "/api/user/state-login")"
-    logged="$(printf '%s' "$state" | xml_tag State)"
-    type="$(printf '%s' "$state" | xml_tag password_type)"
+        # Which login does this firmware expect?
+        state="$(api_get "/api/user/state-login")"
+        logged="$(printf '%s' "$state" | xml_tag State)"
+        type="$(printf '%s' "$state" | xml_tag password_type)"
 
-    if [[ "$logged" == "0" ]]; then
-        ok "No login needed (device without password, or session already open)"
-        return 0
-    fi
-
-    [[ -n "$PASSWORD" ]] || fail "no password configured (set HUAWEI_PASSWORD or edit $CONFIG_FILE)"
-
-    if [[ "$type" == "4" || -z "$type" ]]; then
-        if scram_login; then
-            LOGGED_IN=1
-            ok "Logged in as $USERNAME (SCRAM)"
+        if [[ "$logged" == "0" ]]; then
+            ok "No login needed (device without password, or session already open)"
             return 0
         fi
-        # SCRAM not offered: start again with a clean session for the classic login
-        open_session
-        type=4
-    fi
 
-    classic_login "$type"
-    LOGGED_IN=1
-    ok "Logged in as $USERNAME (password type $type)"
+        [[ -n "$PASSWORD" ]] || fail "no password configured (set HUAWEI_PASSWORD or edit $CONFIG_FILE)"
+
+        if [[ "$type" == "4" || -z "$type" ]]; then
+            scram_login
+            result=$?
+            if (( result == 0 )); then
+                LOGGED_IN=1
+                ok "Logged in as $USERNAME (SCRAM)"
+                return 0
+            fi
+            (( result == 2 )) && continue
+            # SCRAM not offered: start again with a clean session for the classic login
+            open_session
+            type=4
+        fi
+
+        classic_login "$type"
+        result=$?
+        if (( result == 0 )); then
+            LOGGED_IN=1
+            ok "Logged in as $USERNAME (password type $type)"
+            return 0
+        fi
+    done
+    login_refused "$LAST_ANSWER"
 }
 
 # -----------------------------------------------------------------------------

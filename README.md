@@ -84,6 +84,7 @@ Settings are read from a config file and/or environment variables. **Environment
 | `HUAWEI_SMS_LIMIT` | `0` (no limit) | Maximum number of SMS per window |
 | `HUAWEI_SMS_WINDOW` | `3600` | Rate limit window, in seconds |
 | `HUAWEI_STATE_FILE` | `.rthexplorer_sent` next to the script | File used to count sent SMS |
+| `HUAWEI_LOCK_DIR` | `.rthexplorer.lock` next to the script | Lock so that two runs never use the router at the same time (see below) |
 | `HUAWEI_CONFIG` | `rthexplorer.conf` next to the script | Path of the config file |
 
 ### Config file
@@ -183,6 +184,10 @@ Deletes the SMS that were already read and all sent SMS; **unread SMS are kept**
 ```
 
 Useful for automatic recovery when `status` keeps reporting no network. The router is unreachable for 1 to 2 minutes afterwards.
+
+### Several runs at the same time
+
+Huawei routers accept **one web session at a time**: when a second program logs in, the first session is invalidated and its next request fails with error `125003`. RTHexplorer therefore makes runs **wait for each other** (a lock directory, at most 90 s of waiting, stale locks removed after 3 minutes), and retries once if the router still rejects the session. You can safely run `inbox` every minute, `status` every few minutes and `send` at any time.
 
 ### Rate limit
 
@@ -346,6 +351,7 @@ Please [open an issue](https://github.com/StraySnake/RTHexplorer/issues) with yo
 | `login refused: wrong username or password` | Same credentials as the router web page? Special characters are fine inside quotes in the config file. |
 | `login refused: too many attempts` | The router locks logins after several failures. Wait a few minutes. |
 | `login refused: another session is already open` | Log out from the router web page in your browser. |
+| `session rejected by the router … (code 125003)` | Another program (or your browser) logged in at the same moment. RTHexplorer already waits and retries; if it persists, log out from the router web page. |
 | `login refused: the router asks to change the default password first` | Log in once in the router web page and set a new password. |
 | `login aborted: the router's identity could not be verified` | SCRAM signature mismatch: make sure you are really talking to your router (check `HUAWEI_ROUTER_URL`). |
 | `anti-CSRF token not found` | Your firmware may use a different API. Please [open an issue](https://github.com/StraySnake/RTHexplorer/issues) with your model. |
